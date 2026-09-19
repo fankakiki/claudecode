@@ -746,6 +746,30 @@ def main():
     except KeyboardInterrupt:
         logger.info("已手动停止。")
         return 130
+    except PermissionError as e:
+        # 最常见的一种失败：抓包放久了，Cookie 过期。不该甩 traceback 给用户。
+        logger.error("")
+        logger.error("❌ %s", e)
+        logger.error("   Cookie 过期了 —— 这是最常见的情况，不是脚本坏了。")
+        logger.error("")
+        logger.error("   重新抓一次包就行：")
+        logger.error("   1. 浏览器打开选课页面，确认还是登录状态（没登录就先登录）")
+        logger.error("   2. ⌘⌥I 打开开发者工具 → Network → 勾 Fetch/XHR")
+        logger.error("   3. 点一次页面上的「查询」→ 找到 loadJhnCourseInfo 那条")
+        logger.error("      → 右键 Copy → Copy as cURL → 替换文件顶部的 QUERY_CURL")
+        logger.error("   4. 在卢湾1班上点一次「选课」让它失败 → 找到 choiceCourse 那条")
+        logger.error("      → 同样 Copy as cURL → 替换 SUBMIT_CURL")
+        logger.error("")
+        logger.error("   两段都要换：csrfToken 和 Cookie 是一起失效的。")
+        return 2
+    except (OSError, IOError) as e:
+        logger.error("❌ 网络请求失败：%s", e)
+        logger.error("   检查一下能不能正常打开 https://yjsxk.sjtu.edu.cn")
+        return 4
+    except ValueError as e:
+        logger.error("❌ 响应解析失败：%s", e)
+        logger.error("   多半是抓错了接口，或者返回了登录页而不是 JSON。")
+        return 5
 
 
 if __name__ == "__main__":
