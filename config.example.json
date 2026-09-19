@@ -1,0 +1,24 @@
+{
+  "keyword": "MARX6007",
+  "query_curl": "query.curl",
+  "submit_curl": "submit.curl",
+
+  "interval": 1.0,
+  "jitter": 0.2,
+  "timeout": 6.0,
+
+  "burst_attempts": 3,
+  "burst_workers": 1,
+  "burst_gap": 0.15,
+  "stop_on_success": true,
+
+  "_注释_字段覆盖": "probe 推导错了再填，否则留 null 走启发式",
+  "remaining_field": null,
+  "capacity_field": null,
+  "selected_field": null,
+  "combo_order": "selected/capacity",
+
+  "_注释_结果判定": "probe 时把真实的成功/失败响应贴出来对照，必要时改这两个正则",
+  "success_pattern": null,
+  "fail_pattern": null
+}
