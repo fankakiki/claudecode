@@ -41,6 +41,7 @@ INTERVAL = 1.0         # 轮询间隔（秒）。不要往下调，容易被风�
 TIMEOUT = 6.0          # 单次请求超时（秒）
 BURST = 3              # 发现余量后连续提交几次（失败立刻重试，不等下一轮）
 BURST_GAP = 0.15       # 两次提交之间隔多久（秒）
+MAX_FAILS = 20         # 连续多少轮提交失败就停机（防止无意义地反复砸接口）
 NOTIFY = True          # 抢到 / 掉登录时弹 Mac 系统通知
 
 # 字段名已按你的真实响应填好（KXRS=可选人数/容量，DQRS=当前人数/已选）
@@ -222,6 +223,9 @@ class Http(object):
         self.conn = None
 
     def send(self, req, body=None, path=None):
+        # URL 上的 _=<毫秒> 是浏览器加的防缓存参数。原样重放等于每次请求都是同一个
+        # URL，中间任何一层缓存都可能回一份过期的课程列表 —— 那就永远看不到回流票。
+        path = path or _bust_cache(req.path)
         payload = req.body if body is None else body
         data = payload.encode("utf-8") if isinstance(payload, str) else payload
         headers = dict(req.headers)
@@ -237,7 +241,7 @@ class Http(object):
                 raw = resp.read()  # 必须读完，否则连接没法复用
                 if resp.getheader("Connection", "").lower() == "close":
                     self.close()
-                return resp.status, dict(resp.getheaders()), _decode(raw, resp.getheader("Content-Encoding"))
+                return resp.status, resp.getheaders(), _decode(raw, resp.getheader("Content-Encoding"))
             except ssl.SSLCertVerificationError:
                 raise SystemExit(
                     "❌ TLS 证书校验失败。如果你用的是 python.org 装的 Python，\n"
@@ -248,6 +252,59 @@ class Http(object):
                     raise
                 logger.debug("连接中断(%s)，重连重试", e)
         raise RuntimeError("unreachable")
+
+
+_TS_PARAM = re.compile(r"([?&]_=)\d+")
+
+
+def _bust_cache(path):
+    return _TS_PARAM.sub(lambda m: m.group(1) + str(int(time.time() * 1000)), path)
+
+
+def _hdr(headers, name):
+    """从 (k, v) 列表里取某个响应头。"""
+    low = name.lower()
+    for k, v in headers:
+        if k.lower() == low:
+            return v
+    return ""
+
+
+def _parse_cookie_header(value):
+    out = {}
+    for part in (value or "").split(";"):
+        part = part.strip()
+        if part and "=" in part:
+            k, v = part.split("=", 1)
+            out[k.strip()] = v.strip()
+    return out
+
+
+def merge_set_cookie(headers, *reqs):
+    """把服务端下发的 Set-Cookie 合并回请求头。
+
+    会话跑几小时，服务端很可能中途轮换 JSESSIONID / route 之类的 cookie。
+    一直发旧的那份，迟早被当成掉登录。
+    """
+    jar = _parse_cookie_header(reqs[0].headers.get("Cookie", ""))
+    changed = False
+    for k, v in headers:
+        if k.lower() != "set-cookie":
+            continue
+        first = v.split(";", 1)[0].strip()
+        if "=" not in first:
+            continue
+        name, val = first.split("=", 1)
+        name, val = name.strip(), val.strip()
+        if name and jar.get(name) != val:
+            jar[name] = val
+            changed = True
+    if changed:
+        cookie = "; ".join("%s=%s" % kv for kv in jar.items())
+        for r in reqs:
+            r.headers["Cookie"] = cookie
+        logger.debug("Cookie 已更新（服务端轮换）")
+    return changed
 
 
 def _decode(raw, encoding):
@@ -271,7 +328,7 @@ _LOGIN_HINTS = re.compile(r"(未登录|登录超时|请重新登录|统一身份
 def logged_out(status, headers, text):
     if status in (301, 302, 303, 307, 401, 403):
         return True
-    ctype = (headers.get("Content-Type") or "").lower()
+    ctype = _hdr(headers, "Content-Type").lower()
     if "json" not in ctype and "<html" in text[:2000].lower():
         return True
     return bool(_LOGIN_HINTS.search(text[:2000]))
@@ -391,6 +448,37 @@ def label_of(rec):
 
 # ============ 提交与结果判定 ============
 
+_CSRF_KEYNAME = re.compile(r"csrf", re.I)
+_CSRF_IN_BODY = re.compile(r"(csrfToken=)[^&]*", re.I)
+# 提交被 CSRF/令牌挡下来的典型措辞 —— 这种失败重试一万次也没用，必须立刻告诉用户
+_TOKEN_ERR = re.compile(r"(csrf|token|令牌|非法请求|请求非法|重复提交|请刷新|重新登录)", re.I)
+# 提交失败里属于"会话/令牌已死"的那一类：重试再多次也不可能成功，必须停机重抓，
+# 否则脚本会以每秒一次的频率空砸提交接口，纯属自找风控。
+_DEAD_SESSION = re.compile(r"(\[掉登录\]|csrf|token|令牌|非法请求|请求非法|重新登录|会话.*失效|未登录)", re.I)
+
+
+def find_csrf(payload):
+    """查询响应里如果带了新的 csrfToken 就捞出来，用于刷新提交请求体。"""
+    for _, d in walk_dicts(payload):
+        for k, v in d.items():
+            if _CSRF_KEYNAME.search(k) and isinstance(v, str) and len(v) >= 16:
+                return v
+    return None
+
+
+def refresh_csrf(submit, payload):
+    """把提交请求体里的 csrfToken 换成最新的。查询响应里没有就原样不动。"""
+    tok = find_csrf(payload)
+    if not tok or not submit.body or "csrfToken=" not in submit.body.lower():
+        return False
+    new_body = _CSRF_IN_BODY.sub(lambda m: m.group(1) + tok, submit.body)
+    if new_body != submit.body:
+        submit.body = new_body
+        logger.info("🔑 csrfToken 已刷新")
+        return True
+    return False
+
+
 _FAIL_DEFAULT = re.compile(r"(失败|已满|满员|人数已|超过|不允许|不能|冲突|已选过|重复|无效|错误|error|false)", re.I)
 _OK_DEFAULT = re.compile(r"(成功|success|\"code\"\s*:\s*\"?(1|0|200)\"?)", re.I)
 
@@ -407,15 +495,21 @@ def judge(text):
     return False, s
 
 
-def burst_submit(http_sub, submit):
+def burst_submit(http_sub, submit, query=None):
     """抢到余量的瞬间连打几次，失败立刻重试，不等下一个轮询周期。"""
     last = ""
     for i in range(BURST):
         try:
             status, headers, text = http_sub.send(submit)
+            merge_set_cookie(headers, submit, *( [query] if query else [] ))
             if logged_out(status, headers, text):
                 return False, "[掉登录] " + text[:150]
             ok, msg = judge(text)
+            if not ok and _TOKEN_ERR.search(msg):
+                logger.error("🔑 提交被令牌/会话挡下：%s", msg[:150])
+                logger.error("   csrfToken 或 Cookie 已失效，重抓一次 SUBMIT_CURL 才能继续。")
+                notify("抢课脚本：令牌失效", "csrfToken 过期，需要重新抓包")
+                return False, msg
         except Exception as e:
             ok, msg = False, "提交异常: %s" % e
         logger.info("   提交 #%d → %s | %s", i + 1, "成功" if ok else "未成功", msg)
@@ -429,8 +523,9 @@ def burst_submit(http_sub, submit):
 
 # ============ 主流程 ============
 
-def poll(http_q, query):
+def poll(http_q, query, *sync):
     status, headers, text = http_q.send(query)
+    merge_set_cookie(headers, query, *sync)
     if logged_out(status, headers, text):
         raise PermissionError("登录态失效 (HTTP %s)" % status)
     if status >= 400:
@@ -456,6 +551,18 @@ def do_probe(query, submit):
     t0 = time.time()
     payload = poll(http_q, query)
     logger.info("单轮耗时: %.0f ms", (time.time() - t0) * 1000)
+
+    total = None
+    for _, d in walk_dicts(payload):
+        if "total" in d and _as_int(d.get("total")) is not None:
+            total = _as_int(d["total"]); break
+    psize = _as_int((re.search(r"pageSize=(\d+)", query.body or "") or [None, None])[1]) \
+        if re.search(r"pageSize=(\d+)", query.body or "") else None
+    if total is not None and psize is not None and total > psize:
+        logger.warning("⚠️ 接口返回 total=%d 但 pageSize=%d —— 目标可能被分页挡在后面页！"
+                       "把 QUERY_CURL 请求体里的 pageSize 调大。", total, psize)
+    elif total is not None:
+        logger.info("接口 total=%s，目标在第一页内", total)
 
     records = find_records(payload, KEYWORD, CLASS_KEYWORD)
     if not records:
@@ -519,7 +626,7 @@ def run(query, submit, watch_only):
         http_s = Http(submit, TIMEOUT)
     logger.info("🚀 开始监控 %s | 间隔 %.1fs | %s", KEYWORD, INTERVAL, "仅观察" if watch_only else "自动抢")
 
-    cycle = miss = 0
+    cycle = miss = fails = 0
     backoff = 0.0
     last = {}
     skipped = set()
@@ -529,7 +636,8 @@ def run(query, submit, watch_only):
         cycle += 1
         tick = time.time()
         try:
-            payload = poll(http_q, query)
+            payload = poll(http_q, query, submit)
+            refresh_csrf(submit, payload)
             backoff = 0.0
         except PermissionError as e:
             logger.error("❌ %s —— Cookie 过期了，请重新 Copy as cURL 更新 QUERY_CURL", e)
@@ -574,14 +682,33 @@ def run(query, submit, watch_only):
                     logger.info("🔥 出现回流票！余量 %d（仅观察模式，不提交）", rem)
                     continue
                 logger.info("🔥 出现回流票！余量 %d，立即提交！", rem)
-                ok, msg = burst_submit(http_s, submit)
+                ok, msg = burst_submit(http_s, submit, query)
+                if not ok and _DEAD_SESSION.search(msg):
+                    logger.error("❌ 提交被会话/令牌拒绝：%s", msg[:200])
+                    logger.error("   继续重试只会空砸接口、招来风控，脚本停机。")
+                    logger.error("   请重新抓一次两段 cURL（Cookie 和 csrfToken 都要新的）再启动。")
+                    notify("抢课脚本已停止", "会话或 csrfToken 失效，需要重新抓包")
+                    return 2
+                if not ok:
+                    fails += 1
+                    if fails == 5:
+                        logger.warning("⚠️ 已连续 %d 轮提交失败：%s", fails, msg[:120])
+                        logger.warning("   如果每轮都是同样的失败原因，多半不是手慢，而是配置或权限问题。")
+                        notify("抢课脚本", "连续 5 轮提交失败，去看一眼日志")
+                    elif fails >= MAX_FAILS:
+                        logger.error("❌ 连续 %d 轮提交失败，停机避免无意义地反复请求。", fails)
+                        logger.error("   最后一次响应：%s", msg[:200])
+                        notify("抢课脚本已停止", "连续提交失败过多")
+                        return 3
+                else:
+                    fails = 0
                 if ok:
                     logger.info("🎉🎉 选课成功：%s", label_of(rec))
                     logger.info("响应：%s", msg)
                     notify("🎉 抢到了！", "%s 选课成功，去系统里确认一下" % KEYWORD)
                     try:
                         time.sleep(0.6)
-                        for _, r2 in find_records(poll(http_q, query), KEYWORD, CLASS_KEYWORD):
+                        for _, r2 in find_records(poll(http_q, query, submit), KEYWORD, CLASS_KEYWORD):
                             logger.info("复查：%s", json.dumps(r2, ensure_ascii=False)[:300])
                     except Exception:
                         pass
