@@ -34,17 +34,21 @@ SUBMIT_CURL = r"""
 """
 
 # ────────────── 常用参数 ──────────────
-KEYWORD = "MARX6007"   # 目标课程关键词，能在查询结果里唯一定位这门课即可
+KEYWORD = "MARX6007"      # 课程号
+CLASS_KEYWORD = "卢湾1班"  # 教学班关键词。MARX6007 有 3 个班，必须指定到班；
+                          # 留空("")则该课所有教学班都盯（但提交请求只有一个班的，会错炮）
 INTERVAL = 1.0         # 轮询间隔（秒）。不要往下调，容易被风控，反而彻底抢不到
 TIMEOUT = 6.0          # 单次请求超时（秒）
 BURST = 3              # 发现余量后连续提交几次（失败立刻重试，不等下一轮）
 BURST_GAP = 0.15       # 两次提交之间隔多久（秒）
 NOTIFY = True          # 抢到 / 掉登录时弹 Mac 系统通知
 
-# 下面这些一般不用动：probe 推导错了再回来填
-REMAINING_FIELD = None   # 例如 "SYRS"
-CAPACITY_FIELD = None    # 例如 "KCRL"
-SELECTED_FIELD = None    # 例如 "YXZRS"
+# 字段名已按你的真实响应填好（KXRS=可选人数/容量，DQRS=当前人数/已选）
+REMAINING_FIELD = None       # 该系统没有直接的"剩余"字段，留 None
+CAPACITY_FIELD = "KXRS"
+SELECTED_FIELD = "DQRS"
+CONFLICT_FIELD = "IS_CONFLICT"  # 值为 1 表示与你已选课程时间冲突，抢了也是失败
+SKIP_CONFLICT = True            # 冲突的班直接跳过，但会打日志，不静默
 SUCCESS_PATTERN = None   # 例如 r"选课成功"
 FAIL_PATTERN = None      # 例如 r"失败|已满|冲突"
 # ──────────────────────────────────────
@@ -291,10 +295,18 @@ def _scalars(d):
             yield str(v)
 
 
-def find_records(payload, keyword):
-    """找出字面量字段里含关键词的最内层 dict，即课程/教学班记录。"""
-    kw = keyword.lower()
-    hits = [(p, d) for p, d in walk_dicts(payload) if any(kw in s.lower() for s in _scalars(d))]
+def _matches(rec, *keywords):
+    vals = [v.lower() for v in _scalars(rec)]
+    return all(any(kw.lower() in v for v in vals) for kw in keywords if kw)
+
+
+def find_records(payload, keyword, class_keyword=""):
+    """找出字面量字段里含关键词的最内层 dict，即课程/教学班记录。
+
+    同一门课往往有多个教学班（MARX6007 就有 3 个），而提交请求只对应其中一个，
+    所以必须能筛到班一级，否则会拿 A 班的余量去点 B 班的选课按钮。
+    """
+    hits = [(p, d) for p, d in walk_dicts(payload) if _matches(d, keyword, class_keyword)]
     out = []
     for p, d in hits:
         deeper = any(q != p and q.startswith(p) and q[len(p):len(p) + 1] in (".", "[") for q, _ in hits)
@@ -303,9 +315,17 @@ def find_records(payload, keyword):
     return out
 
 
-_REM_PAT = re.compile(r"(syrs|kyrs|sy_rs|kxrs|剩余|余量|remain|surplus|available|free)", re.I)
-_CAP_PAT = re.compile(r"(kcrl|kkrl|jxbrl|容量|capacity|zrs|total|maxnum|max_num|upperlimit|limit)", re.I)
-_SEL_PAT = re.compile(r"(yxrs|yxzrs|xkrs|yx_rs|已选|selected|selectnum|enrolled)", re.I)
+def is_conflict(rec):
+    """该教学班是否与已选课程冲突（冲突的话抢到也是提交失败）。"""
+    if not SKIP_CONFLICT or not CONFLICT_FIELD:
+        return False
+    return _as_int(rec.get(CONFLICT_FIELD)) == 1
+
+
+# 注意：kxrs(可选人数) 是"容量"不是"剩余"，误判成剩余会导致满员时疯狂空炮
+_REM_PAT = re.compile(r"(syrs|kyrs|sy_rs|剩余|余量|remain|surplus|available|free)", re.I)
+_CAP_PAT = re.compile(r"(kxrs|kcrl|kkrl|jxbrl|容量|capacity|zrs|total|maxnum|max_num|upperlimit|limit)", re.I)
+_SEL_PAT = re.compile(r"(dqrs|yxrs|yxzrs|xkrs|yx_rs|已选|selected|selectnum|enrolled)", re.I)
 _COMBO_PAT = re.compile(r"^\s*(\d+)\s*/\s*(\d+)\s*$")
 
 
@@ -363,7 +383,7 @@ def label_of(rec):
     picks = []
     for k, v in rec.items():
         if isinstance(v, str) and v.strip() and len(v) <= 40 and re.search(
-                r"(kcmc|课程名|name|jxbmc|教学班|teacher|jsxm|skjs)", k, re.I):
+                r"(bjmc|kcmc|课程名|name|jxbmc|教学班|teacher|jsxm|skjs|rkjs)", k, re.I):
             picks.append(v.strip())
     ident = " / ".join(dict.fromkeys(picks))[:60]
     return "%s%s" % (KEYWORD, " · " + ident if ident else "")
@@ -418,7 +438,12 @@ def poll(http_q, query):
     try:
         return json.loads(text)
     except ValueError:
-        raise ValueError("响应不是 JSON：%s" % text[:200])
+        # 有些字段（如排课时间 PKSJDDMS）里带裸换行，严格 JSON 解析会失败。
+        # 去掉换行对合法 JSON 无损（引号外的换行只是空白），对这种脏数据正好救回来。
+        try:
+            return json.loads(text.replace("\r", "").replace("\n", ""))
+        except ValueError:
+            raise ValueError("响应不是 JSON：%s" % text[:200])
 
 
 def do_probe(query, submit):
@@ -432,7 +457,7 @@ def do_probe(query, submit):
     payload = poll(http_q, query)
     logger.info("单轮耗时: %.0f ms", (time.time() - t0) * 1000)
 
-    records = find_records(payload, KEYWORD)
+    records = find_records(payload, KEYWORD, CLASS_KEYWORD)
     if not records:
         logger.error("❌ 响应里没有含 '%s' 的记录。可能是：", KEYWORD)
         logger.error("   · 抓的不是课程列表接口 —— 换一条 XHR 重抓")
@@ -442,8 +467,13 @@ def do_probe(query, submit):
         return 1
 
     logger.info("✅ 命中 %d 条记录：", len(records))
+    if len(records) > 1:
+        logger.warning("⚠️ 匹配到 %d 个教学班。提交请求只对应其中一个，"
+                       "请用 CLASS_KEYWORD 精确到班，否则会拿这个班的余量去点另一个班。", len(records))
     for path, rec in records:
         rem, how = read_quota(rec)
+        if is_conflict(rec):
+            logger.warning(">>> ⚠️ 该班 IS_CONFLICT=1（与已选课程冲突），运行时会被跳过")
         logger.info("--- %s ---", path)
         logger.info("%s", json.dumps(rec, ensure_ascii=False, indent=2)[:1500])
         logger.info(">>> 余量推导: %s  →  剩余 %s", how, rem)
@@ -492,6 +522,7 @@ def run(query, submit, watch_only):
     cycle = miss = 0
     backoff = 0.0
     last = {}
+    skipped = set()
     t_start = time.time()
 
     while True:
@@ -511,7 +542,7 @@ def run(query, submit, watch_only):
             time.sleep(backoff)
             continue
 
-        records = find_records(payload, KEYWORD)
+        records = find_records(payload, KEYWORD, CLASS_KEYWORD)
         if not records:
             miss += 1
             if miss in (3, 10) or miss % 50 == 0:
@@ -522,6 +553,12 @@ def run(query, submit, watch_only):
         miss = 0
 
         for path, rec in records:
+            if is_conflict(rec):
+                if path not in skipped:
+                    skipped.add(path)
+                    logger.warning("⏭️ 跳过 %s：IS_CONFLICT=1，与你已选课程时间冲突，抢到也会被拒",
+                                   label_of(rec))
+                continue
             rem, how = read_quota(rec)
             if rem is None:
                 if cycle == 1 or cycle % 120 == 0:
@@ -544,7 +581,7 @@ def run(query, submit, watch_only):
                     notify("🎉 抢到了！", "%s 选课成功，去系统里确认一下" % KEYWORD)
                     try:
                         time.sleep(0.6)
-                        for _, r2 in find_records(poll(http_q, query), KEYWORD):
+                        for _, r2 in find_records(poll(http_q, query), KEYWORD, CLASS_KEYWORD):
                             logger.info("复查：%s", json.dumps(r2, ensure_ascii=False)[:300])
                     except Exception:
                         pass
