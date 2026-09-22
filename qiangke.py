@@ -38,7 +38,8 @@ KEYWORD = "MARX6007"      # 课程号
 CLASS_KEYWORD = "卢湾1班"  # 教学班关键词。MARX6007 有 3 个班，必须指定到班；
                           # 留空("")则该课所有教学班都盯（但提交请求只有一个班的，会错炮）
 INTERVAL = 1.0         # 轮询间隔（秒）。不要往下调，容易被风控，反而彻底抢不到
-TIMEOUT = 6.0          # 单次请求超时（秒）
+TIMEOUT = 15.0         # 读取响应的超时（秒）。网络差时给足耐心，别把慢当成失败
+CONNECT_TIMEOUT = 8.0  # 建连+TLS握手的超时（秒）。握手卡住要快速失败重来
 BURST = 3              # 发现余量后连续提交几次（失败立刻重试，不等下一轮）
 BURST_GAP = 0.15       # 两次提交之间隔多久（秒）
 MAX_FAILS = 20         # 连续多少轮提交失败就停机（防止无意义地反复砸接口）
@@ -203,16 +204,22 @@ def parse_curl(text, label):
 class Http(object):
     """复用同一条 TCP/TLS 连接，省掉每轮握手；断了自动重连一次。"""
 
-    def __init__(self, req, timeout):
+    def __init__(self, req, timeout, connect_timeout=None):
         self.host, self.port, self.tls, self.timeout = req.host, req.port, req.scheme == "https", timeout
+        self.connect_timeout = connect_timeout or timeout
         self.conn = None
 
     def _connect(self):
+        # 握手和读取用两个超时：握手卡住要尽快放弃重来，读取则要给服务器慢慢答的余地。
         if self.tls:
             ctx = ssl.create_default_context()
-            self.conn = http.client.HTTPSConnection(self.host, self.port, timeout=self.timeout, context=ctx)
+            self.conn = http.client.HTTPSConnection(
+                self.host, self.port, timeout=self.connect_timeout, context=ctx)
         else:
-            self.conn = http.client.HTTPConnection(self.host, self.port, timeout=self.timeout)
+            self.conn = http.client.HTTPConnection(self.host, self.port, timeout=self.connect_timeout)
+        self.conn.connect()
+        if self.conn.sock is not None:
+            self.conn.sock.settimeout(self.timeout)
 
     def close(self):
         try:
@@ -547,7 +554,7 @@ def do_probe(query, submit):
                 len(query.headers), "有" if "Cookie" in query.headers else "⚠️ 无",
                 "%d 字节" % len(query.body) if query.body else "无")
 
-    http_q = Http(query, TIMEOUT)
+    http_q = Http(query, TIMEOUT, CONNECT_TIMEOUT)
     t0 = time.time()
     payload = poll(http_q, query)
     logger.info("单轮耗时: %.0f ms", (time.time() - t0) * 1000)
@@ -616,14 +623,14 @@ def wait_until(ts):
 
 
 def run(query, submit, watch_only):
-    http_q = Http(query, TIMEOUT)
+    http_q = Http(query, TIMEOUT, CONNECT_TIMEOUT)
     # 同域名就共用一条连接：它被轮询一直焐着，真要提交时省掉 TCP+TLS 握手，
     # 而那几百毫秒正好花在最关键的一刻上。
     if submit.netloc == query.netloc:
         http_s = http_q
         logger.debug("提交与查询同域，共用长连接")
     else:
-        http_s = Http(submit, TIMEOUT)
+        http_s = Http(submit, TIMEOUT, CONNECT_TIMEOUT)
     logger.info("🚀 开始监控 %s | 间隔 %.1fs | %s", KEYWORD, INTERVAL, "仅观察" if watch_only else "自动抢")
 
     cycle = miss = fails = 0
@@ -717,11 +724,19 @@ def run(query, submit, watch_only):
                 logger.info("😢 这次没抢到（%s），继续盯。", msg[:100])
 
         if cycle % 60 == 0:
-            logger.info("… 已盯 %d 轮 / %.1f 分钟，当前余量 %s", cycle, (time.time() - t_start) / 60,
-                        list(last.values()) or "未知")
+            mins = (time.time() - t_start) / 60
+            per = (time.time() - t_start) / cycle
+            logger.info("… 已盯 %d 轮 / %.1f 分钟 | 平均 %.2fs/轮（理想 %.2fs）| 当前余量 %s",
+                        cycle, mins, per, INTERVAL, list(last.values()) or "未知")
+            if per > INTERVAL * 1.5:
+                logger.warning("⚠️ 实际节奏比设定慢了 %.0f%%，说明请求本身在拖时间，"
+                               "不是脚本在等。先确认浏览器打开选课页快不快。", (per / INTERVAL - 1) * 100)
 
         elapsed = time.time() - tick
         logger.debug("第 %d 轮耗时 %.0f ms", cycle, elapsed * 1000)
+        if elapsed > max(3.0, INTERVAL * 3) and cycle > 1:
+            logger.warning("🐢 本轮耗时 %.1fs（正常应在 0.1s 内）—— 网络或服务器很慢，"
+                           "回流票可能在这段空窗里被别人抢走。", elapsed)
         time.sleep(max(0.0, INTERVAL - elapsed))
 
 
