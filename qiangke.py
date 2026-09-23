@@ -49,8 +49,9 @@ NOTIFY = True          # 抢到 / 掉登录时弹 Mac 系统通知
 REMAINING_FIELD = None       # 该系统没有直接的"剩余"字段，留 None
 CAPACITY_FIELD = "KXRS"
 SELECTED_FIELD = "DQRS"
-CONFLICT_FIELD = "IS_CONFLICT"  # 值为 1 表示与你已选课程时间冲突，抢了也是失败
-SKIP_CONFLICT = True            # 冲突的班直接跳过，但会打日志，不静默
+CONFLICT_FIELD = "IS_CONFLICT"  # 接口里的冲突标记。只作提示：它的判定和你的实际课表未必一致
+SKIP_CONFLICT = False           # 默认不据此跳过，能不能选由服务器的提交结果说了算。
+                                # 判错跳过 = 永远抢不到；照抢判错 = 服务器回一句"冲突"，脚本停下告诉你
 SUCCESS_PATTERN = None   # 例如 r"选课成功"
 FAIL_PATTERN = None      # 例如 r"失败|已满|冲突"
 # ──────────────────────────────────────
@@ -379,11 +380,14 @@ def find_records(payload, keyword, class_keyword=""):
     return out
 
 
+def conflict_flagged(rec):
+    """接口是否把该教学班标成了冲突。只是标记，不代表服务器一定会拒绝提交。"""
+    return bool(CONFLICT_FIELD) and _as_int(rec.get(CONFLICT_FIELD)) == 1
+
+
 def is_conflict(rec):
-    """该教学班是否与已选课程冲突（冲突的话抢到也是提交失败）。"""
-    if not SKIP_CONFLICT or not CONFLICT_FIELD:
-        return False
-    return _as_int(rec.get(CONFLICT_FIELD)) == 1
+    """是否因冲突标记而跳过该班（仅当 SKIP_CONFLICT 打开时）。"""
+    return SKIP_CONFLICT and conflict_flagged(rec)
 
 
 # 注意：kxrs(可选人数) 是"容量"不是"剩余"，误判成剩余会导致满员时疯狂空炮
@@ -461,6 +465,7 @@ _CSRF_IN_BODY = re.compile(r"(csrfToken=)[^&]*", re.I)
 _TOKEN_ERR = re.compile(r"(csrf|token|令牌|非法请求|请求非法|重复提交|请刷新|重新登录)", re.I)
 # 提交失败里属于"会话/令牌已死"的那一类：重试再多次也不可能成功，必须停机重抓，
 # 否则脚本会以每秒一次的频率空砸提交接口，纯属自找风控。
+_SERVER_CONFLICT = re.compile(r"冲突")
 _DEAD_SESSION = re.compile(r"(\[掉登录\]|csrf|token|令牌|非法请求|请求非法|重新登录|会话.*失效|未登录)", re.I)
 
 
@@ -586,8 +591,11 @@ def do_probe(query, submit):
                        "请用 CLASS_KEYWORD 精确到班，否则会拿这个班的余量去点另一个班。", len(records))
     for path, rec in records:
         rem, how = read_quota(rec)
-        if is_conflict(rec):
-            logger.warning(">>> ⚠️ 该班 IS_CONFLICT=1（与已选课程冲突），运行时会被跳过")
+        if conflict_flagged(rec):
+            if SKIP_CONFLICT:
+                logger.warning(">>> ⚠️ 该班 IS_CONFLICT=1，SKIP_CONFLICT 已开启，运行时会被跳过")
+            else:
+                logger.warning(">>> ℹ️ 该班 IS_CONFLICT=1。不会跳过，有票照抢，以服务器提交结果为准")
         logger.info("--- %s ---", path)
         logger.info("%s", json.dumps(rec, ensure_ascii=False, indent=2)[:1500])
         logger.info(">>> 余量推导: %s  →  剩余 %s", how, rem)
@@ -669,11 +677,14 @@ def run(query, submit, watch_only):
 
         actionable = 0
         for path, rec in records:
+            if conflict_flagged(rec) and path not in skipped:
+                skipped.add(path)
+                if SKIP_CONFLICT:
+                    logger.warning("⏭️ 跳过 %s：接口标记 IS_CONFLICT=1（SKIP_CONFLICT 已开启）", label_of(rec))
+                else:
+                    logger.info("ℹ️ %s 在接口里标着 IS_CONFLICT=1。脚本不据此跳过，"
+                                "有票照抢，能不能选以服务器的提交结果为准。", label_of(rec))
             if is_conflict(rec):
-                if path not in skipped:
-                    skipped.add(path)
-                    logger.warning("⏭️ 跳过 %s：IS_CONFLICT=1，与你已选课程时间冲突，抢到也会被拒",
-                                   label_of(rec))
                 continue
             actionable += 1
             rem, how = read_quota(rec)
@@ -692,6 +703,12 @@ def run(query, submit, watch_only):
                     continue
                 logger.info("🔥 出现回流票！余量 %d，立即提交！", rem)
                 ok, msg = burst_submit(http_s, submit, query)
+                if not ok and _SERVER_CONFLICT.search(msg):
+                    logger.error("❌ 服务器明确拒绝：%s", msg[:200])
+                    logger.error("   这是服务器判定的冲突，重试结果不会变，脚本停机。")
+                    logger.error("   去「已选课程」里查：有没有周一 3-5 节的课，或是否已选过 MARX6007 的其他班。")
+                    notify("抢课脚本已停止", "服务器判定冲突，去看已选课程")
+                    return 6
                 if not ok and _DEAD_SESSION.search(msg):
                     logger.error("❌ 提交被会话/令牌拒绝：%s", msg[:200])
                     logger.error("   继续重试只会空砸接口、招来风控，脚本停机。")
