@@ -633,7 +633,7 @@ def run(query, submit, watch_only):
         http_s = Http(submit, TIMEOUT, CONNECT_TIMEOUT)
     logger.info("🚀 开始监控 %s | 间隔 %.1fs | %s", KEYWORD, INTERVAL, "仅观察" if watch_only else "自动抢")
 
-    cycle = miss = fails = 0
+    cycle = miss = fails = blocked = 0
     backoff = 0.0
     last = {}
     skipped = set()
@@ -667,6 +667,7 @@ def run(query, submit, watch_only):
             continue
         miss = 0
 
+        actionable = 0
         for path, rec in records:
             if is_conflict(rec):
                 if path not in skipped:
@@ -674,6 +675,7 @@ def run(query, submit, watch_only):
                     logger.warning("⏭️ 跳过 %s：IS_CONFLICT=1，与你已选课程时间冲突，抢到也会被拒",
                                    label_of(rec))
                 continue
+            actionable += 1
             rem, how = read_quota(rec)
             if rem is None:
                 if cycle == 1 or cycle % 120 == 0:
@@ -722,6 +724,19 @@ def run(query, submit, watch_only):
                     logger.info("⚠️ 请立刻去选课系统刷新页面确认，不要只信这条日志。")
                     return 0
                 logger.info("😢 这次没抢到（%s），继续盯。", msg[:100])
+
+        if actionable == 0:
+            blocked += 1
+            if blocked in (3, 20) or blocked % 300 == 0:
+                logger.warning("=" * 60)
+                logger.warning("⚠️ 目标的所有教学班都被判为冲突，脚本永远不会出手 —— 这样跑下去是白跑！")
+                logger.warning("   要么退掉那门撞时间的课，要么把文件顶部 SKIP_CONFLICT 改成 False")
+                logger.warning("   让它照抢（真被服务器拦下的话，连续失败保护会停机）。")
+                logger.warning("=" * 60)
+                if blocked == 3:
+                    notify("抢课脚本空转中", "目标班全部冲突，脚本不会出手")
+        else:
+            blocked = 0
 
         if cycle % 60 == 0:
             mins = (time.time() - t_start) / 60
